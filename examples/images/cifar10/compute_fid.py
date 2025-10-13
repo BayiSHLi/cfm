@@ -18,7 +18,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
 
 # Training
-flags.DEFINE_string("input_dir", "./ckpt", help="output_directory")
+flags.DEFINE_string("input_dir", "/workspace/SHLi/conditional-flow-matching/examples/images/cifar10/ckpt", help="output_directory")
 flags.DEFINE_string("model", "otcfm", help="flow matching model type")
 flags.DEFINE_integer("integration_steps", 100, help="number of inference steps")
 flags.DEFINE_string("integration_method", "dopri5", help="integration method to use")
