@@ -155,6 +155,7 @@ slurm*.out
 
 # Data and models
 *.pt
+*.pth
 *.h5
 *.h5ad
 *.tar
