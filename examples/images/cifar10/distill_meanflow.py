@@ -14,9 +14,7 @@ import math
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchvision.models import inception_v3, Inception_V3_Weights
 
-from torch.cuda import OutOfMemoryError
-import time
-import gc
+import swanlab
 
 # 你可能需要在这个库里找到 teacher model class、采样 / trajectory 方法、加载 checkpoint 的方法
 
@@ -44,56 +42,43 @@ class TimeEmbedding(nn.Module):
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=1)  # [B, dim]
         return self.net(emb)
     
-class StudentMeanFlow(nn.Module):
+class StudentMeanFlow(UNetModelWrapper):
     def __init__(self, in_channels=3, base_ch=64, time_emb_dim=128):
-        super().__init__()
-        # a lightweight conv encoder-decoder with time conditioning
+        super().__init__(        
+            dim=(3, 32, 32),
+            num_res_blocks=2,
+            num_channels=128, #base channel of UNet
+            channel_mult=[1, 2, 2, 2],
+            num_heads=4,
+            num_head_channels=64,
+            attention_resolutions="16",
+            dropout=0.1,
+            )
+        # process time embeddings into spatial maps
         self.time_emb_dim = time_emb_dim
         self.time_emb_net = TimeEmbedding(time_emb_dim)
 
-        # encoder
-        self.enc = nn.Sequential(
-            nn.Conv2d(in_channels, base_ch, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(base_ch, base_ch, 3, padding=1),
-            nn.ReLU(),
-        )
-        # process time embeddings into spatial maps
         self.time_proj = nn.Sequential(
             nn.Linear(time_emb_dim * 2, base_ch),  # we will concat t1 and t2 embeddings
             nn.ReLU()
         )
 
-        # decoder / residual convs
-        self.dec = nn.Sequential(
-            nn.Conv2d(base_ch, base_ch, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(base_ch, in_channels, 3, padding=1),
-        )
-
-    def forward(self, x_t1, t1, t2):
+    def forward(self, x_t1, t1, t2, y=None):
         """
         x_t1: [B, C, H, W]
         t1, t2: [B] scalars in [0,1]
         returns v_bar_pred: [B, C, H, W]
         """
         B = x_t1.shape[0]
-        feat = self.enc(x_t1)  # [B, base_ch, H, W]
         te1 = self.time_emb_net(t1)  # [B, time_emb_dim]
         te2 = self.time_emb_net(t2)
         te = torch.cat([te1, te2], dim=1)  # [B, 2*time_emb_dim]
         tp = self.time_proj(te)  # [B, base_ch]
-        # expand to spatial map
-        tp_map = tp.unsqueeze(-1).unsqueeze(-1)  # [B, base_ch, 1,1]
-        feat = feat + tp_map  # broadcast add
-        out = self.dec(feat)
-        # output is v_bar prediction (no activation)
-        return out
+
+        return super().forward(tp, x_t1, y=y)
 
 
 def load_teacher_and_node(ckpt_path, device, integration_method):
-    # 你要在 conditional-flow-matching 代码库里写这个接口，加载模型权重、初始化采样函数
-    # 下面是伪代码 /骨架
     teacher = UNetModelWrapper(
         dim=(3, 32, 32),
         num_res_blocks=2,
@@ -450,6 +435,8 @@ def save_checkpoint(student, name):
 # Training loop: online distillation using teacher trajectories
 # ---------------------------
 def train_distillation(args):
+    run = swanlab.init(project="distill_meanflow", name=args.exp_name, config=vars(args))
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     # load teacher and node wrapper from conditional-flow-matching repo
     ckpt_path = f"{args.input_dir}/{args.model}/{args.model}_cifar10_weights_step_{args.step}.pt"
@@ -493,6 +480,7 @@ def train_distillation(args):
             optim_stu.step()
 
             pbar.set_description(f"ep{epoch} step{i} loss:{loss.item():.6f} idx1:{idx1} idx2:{idx2}")
+            swanlab.log({"train/loss": loss.item(), "epoch": epoch})
 
         # end epoch eval (partial)
         if (epoch + 1) % args.eval_every == 0:
@@ -500,6 +488,12 @@ def train_distillation(args):
             avg_pixel, avg_lpips, avg_feat = fast_eval_student(student, teacher_model, 
                                                                node, lpips_metric, 
                                                                feat_net, device, args)
+            swanlab.log({
+                "eval/avg_pixel_mse": avg_pixel,
+                "eval/avg_lpips": avg_lpips,
+                "eval/avg_feat_mse": avg_feat,
+                "epoch": epoch
+            })
             # 主指标：LPIPS（越小越好）
             if avg_lpips < best_lpips:
                 best_lpips = avg_lpips
@@ -534,6 +528,7 @@ def train_distillation(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--exp_name", type=str, default="unet_student")
     parser.add_argument("--model", type=str, default="cfm")
     parser.add_argument("--step", type=int, default=400000)
     parser.add_argument("--input_dir", type=str, default="/workspace/SHLi/conditional-flow-matching/examples/images/cifar10/ckpt")
@@ -546,7 +541,7 @@ if __name__ == "__main__":
     parser.add_argument("--img_size", type=int, default=32)
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps_per_epoch", type=int, default=100)
     parser.add_argument("--eval_every", type=int, default=1)
     parser.add_argument("--batch_size_fid", type=int, default=5000)
