@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch import optim
 # from torchvision import transforms, datasets
-# from torchvision.utils import save_image
+from torchvision.utils import save_image
 from tqdm import tqdm
 from cleanfid import fid
 from torchcfm.models.unet.unet import UNetModelWrapper
@@ -129,13 +129,24 @@ def compute_vbar_from_traj(traj, t_span, idx1, idx2):
 
 
 
-def gen_1_img(student, batch, img_size, device):
+def gen_1_img(student, batch, img_size, device, sample_steps=2):
     with torch.no_grad():
+        # 起始噪声 z at t=1
         z = torch.randn(batch, 3, img_size, img_size, device=device)
-        t1 = torch.zeros(batch, device=device)
-        t2 = torch.ones(batch, device=device)
-        x_pred = student(z, t1, t2)
-        imgs = torch.clamp((x_pred + 1) / 2, 0, 1)
+        # 构造时间格点，从 1 -> 0
+        t = torch.linspace(0.0, 1.0, sample_steps + 1, device=device)
+        for i in range(sample_steps):
+            t1 = torch.full((batch,), t[i], device=device)
+            t2 = torch.full((batch,), t[i+1], device=device)
+            vbar = student(z, t1, t2)  # 预测 average velocity
+            # 乘时间差
+            delta = (t2 - t1)  # 这是标量，通常负数
+            # delta 相对于每样本可以是向量，但这里常量
+            # reshape delta to broadcast to (batch,1,1,1)
+            delta_map = delta.view(-1, *([1] * (z.dim()-1)))
+            z = z + delta_map * vbar  # 更新
+        # 生成图像
+        imgs = torch.clamp((z + 1.0) / 2.0, 0.0, 1.0)
     return imgs
 
 
@@ -220,10 +231,39 @@ def fast_eval_student(student, teacher_model, node, lpips_metric,
     student.train()
     return avg_pixel, avg_lpips, avg_feat
 
+
+def visualize_student_outputs(student, device, args, prefix: str = "eval"):
+    """
+    从 student 中采样一小批图像并保存，用于快速视觉检查。
+    prefix 用于文件命名，如 "eval_epoch5"
+    """
+    student.eval()
+    with torch.no_grad():
+        # 采样少量（如 16 或 25 张图）用于可视化
+        n_vis = min(args.visualize_num, args.eval_batch)
+        x1 = torch.randn(n_vis, 3, args.img_size, args.img_size, device=device)
+        t1 = torch.ones(n_vis, device=device) * args.t1_vis  # e.g. t1 = 1.0
+        t2 = torch.zeros(n_vis, device=device)  # e.g. t2 = 0.0
+        vbar = student(x1, t1, t2)
+        x0_pred = x1 + (t2 - t1) * vbar
+        x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+
+        # 转换到 [0,1]
+        imgs = (x0_pred + 1.0) / 2.0
+        imgs = torch.clamp(imgs, 0.0, 1.0)
+
+        save_dir = os.path.join(args.out_dir, "vis")
+        os.makedirs(save_dir, exist_ok=True)
+        fname = os.path.join(save_dir, f"{prefix}_samples.png")
+        save_image(imgs, fname, nrow=int(math.sqrt(n_vis)))
+        print(f"Visualized student outputs to {fname}")
+
+    student.train()
+
 # ---------------------------
 # Evaluation function: generate samples from student and compute FID using CleanFID
 # ---------------------------
-def evaluate_student(student, device, args):
+def evaluate_student(student, device, args, sample_steps=2):
     """
     Evaluate distilled MeanFlow model using CleanFID.
     假设student生成的样本范围为[-1,1]
@@ -233,7 +273,7 @@ def evaluate_student(student, device, args):
     # 3️⃣ 使用 CleanFID 计算 FID
     print("[Eval] Calculating CleanFID score...")
     fid_score = fid.compute_fid(
-        gen=lambda n: gen_1_img(student, args.batch_size_fid, args.img_size, device),
+        gen=lambda n: gen_1_img(student, args.batch_size_fid, args.img_size, device, sample_steps),
         dataset_name="cifar10",
         batch_size=args.batch_size_fid,
         dataset_res=32,
@@ -244,6 +284,8 @@ def evaluate_student(student, device, args):
 
     print(f"[Eval] Student MeanFlow FID: {fid_score:.4f}")
     student.train()
+
+    visualize_student_outputs(student, device, args, prefix="eval_final")
 
 
 
@@ -349,83 +391,6 @@ def sample_teacher_trajectory(teacher_model, node, device, x0, integration_metho
         raise e
 
 
-# def train_one_step(teacher_model, node, student, device, args):
-#     # sample initial noise x(t=0?) NOTE: in gen_1_img they used x = randn(..., device), then integrated to get image at final time. 
-#     # Their convention: they start from noise at t=0 and integrate to t=1 (or vice versa). 
-#     # We will mirror gen_1_img: start x0 as noise at t=0 and traj[-1] is final image at t=1. # But earlier we used t in [0,1] with x(1)=image; choose convention consistent with teacher.
-#     x_noise = torch.randn(args.batch, 3, args.img_size, args.img_size, device=device)
-#     # traj: [T, B, C, H, W] 
-#     # compute trajectory
-#     traj, t_span = sample_teacher_trajectory(teacher_model, node, device, x_noise, 
-#                                              args.integration_method, args.integration_steps, 
-#                                              y=None, tol=args.tol)
-    
-#     # now randomly select pairs of (idx1, idx2) for supervision, ensure idx2 > idx1
-#     T = traj.shape[0]
-#     # choose random indices: we want t1 < t2 ideally (or t1 > t2 sign handled)
-#     # We'll pick idx1 < idx2 so denom positive (t2 - t1 > 0)
-#     idx1 = torch.randint(0, T - 1, (1,)).item()
-#     idx2 = torch.randint(idx1 + 1, T, (1,)).item()
-#     vbar_true, x1, x2, t1_val, t2_val = compute_vbar_from_traj(traj, t_span, idx1, idx2)
-
-#     # x1 corresponds to traj[idx1] (state at t1), this is the student input
-#     # vbar_true = (x2 - x1)/(t2 - t1)
-#     # Prepare input tensors
-#     x1 = x1.to(device)
-#     # prepare time tensors of shape [B]
-#     B = x1.shape[0]
-#     t1_tensor = torch.full((B,), float(t1_val), device=device)
-#     t2_tensor = torch.full((B,), float(t2_val), device=device)
-#     # student forward
-#     vbar_pred = student(x1, t1_tensor, t2_tensor) 
-#     # loss: regression MSE on vbar 
-#     loss = nn.functional.mse_loss(vbar_pred, vbar_true.to(device)) 
-#     # optional: add small pixel loss on reconstructed images to stabilise 
-#     if args.recon_loss_weight > 0: 
-#         # reconstruct x2_pred
-#         x2_pred = x1 + (t2_val - t1_val) * vbar_pred 
-#         loss_recon = nn.functional.mse_loss(x2_pred, x2.to(device)) 
-#         loss = loss + args.recon_loss_weight * loss_recon 
-#     return loss, idx1, idx2
-
-
-# def sample_teacher_trajectory(teacher_model, node, device, x0, integration_method, integration_steps, y=None, tol=1e-5): 
-#     """ 
-#     Produce trajectory for batch x0 (initial noise) over t_span [0,1] 
-#     - If node is provided and has .trajectory(x, t_span, y) use it (preferred for efficiency) 
-#     - Else use odeint with teacher_model as RHS (teacher_model(x, t, y) -> dx/dt) 
-#     Return: traj: [T, B, C, H, W] t_span: [T] tensor 
-#     """ 
-#     with torch.no_grad(): 
-#         # define t_span 
-#         if integration_method == "euler": 
-#             t_span = torch.linspace(0.0, 1.0, steps=integration_steps + 1, device=device) 
-#             if node is not None and hasattr(node, "trajectory"): 
-#                 traj = node.trajectory(x0, t_span=t_span) 
-#                 # hopefully returns [T, B, C, H, W] 
-#             else: 
-#                 # fallback: simple Euler integration using teacher_model 
-#                 x = x0 
-#                 traj_list = [x0] 
-#                 dt = 1.0 / integration_steps 
-#                 for k in range(integration_steps): 
-#                     t = torch.full((x0.shape[0],), k * dt, device=device) 
-#                     # teacher_model expects (x, timesteps, y) 
-#                     v = teacher_model(t, x, y) # instantaneous velocity 
-#                     x = x + dt * v 
-#                     traj_list.append(x) 
-#                     traj = torch.stack(traj_list, dim=0) 
-#         else: # use odeint for coarse integration (2 points as gen_1_img did) 
-#             t_span = torch.tensor([0.0, 1.0], device=device) 
-#             # odeint expects func(t, x) 
-#             def rhs(t, x_flat): 
-#                 # x_flat: [B, C, H, W] flattened to [B, ...] by odeint, but it works with same shape 
-#                 # build t_batch 
-#                 t_b = torch.full((x0.shape[0],), float(t.cpu().numpy()), device=device) 
-#                 return teacher_model(t_b, x_flat, y) 
-#             traj = odeint(rhs, x0, t_span, rtol=tol, atol=tol, method=integration_method) 
-#     return traj, t_span
-
 def save_checkpoint(student, name):
     os.makedirs(args.out_dir, exist_ok=True)
     torch.save(student.state_dict(), os.path.join(args.out_dir, name))
@@ -445,6 +410,11 @@ def train_distillation(args):
 
     # init student
     student = StudentMeanFlow(in_channels=3, base_ch=args.base_ch, time_emb_dim=args.time_emb).to(device)
+    # resume from checkpoint if provided
+    if args.resume_ckpt and os.path.isfile(args.resume_ckpt):
+        print(f"Resuming student from {args.resume_ckpt}...")
+        student.load_state_dict(torch.load(args.resume_ckpt, map_location=device))
+    
     optim_stu = optim.Adam(student.parameters(), lr=args.lr)
 
     # eval LPIPS metric
@@ -519,7 +489,7 @@ def train_distillation(args):
     # test on best model
     print("Evaluating best model on FID...")
     student.load_state_dict(torch.load(os.path.join(args.out_dir, "student_meanflow_best.pth")))
-    evaluate_student(student, device, args)
+    evaluate_student(student, device, args, sample_steps=2)
 
     return student
 
@@ -532,6 +502,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="cfm")
     parser.add_argument("--step", type=int, default=400000)
     parser.add_argument("--input_dir", type=str, default="/workspace/SHLi/conditional-flow-matching/examples/images/cifar10/ckpt")
+    parser.add_argument("--resume_ckpt", type=str, default="/workspace/SHLi/conditional-flow-matching/examples/images/cifar10/distill_outputs_1014_2/student_meanflow_best.pth", help="path to student checkpoint to resume")
     parser.add_argument("--integration_steps", type=int, default=100)
     parser.add_argument("--integration_method", type=str, default="euler")
     parser.add_argument("--tol", type=float, default=1e-5)
